@@ -11,6 +11,7 @@ import { TAKUMI_FORMATS } from '../font-source'
 import { buildSubsetFamilyChain, extractCodepoints, getDefaultFontFamily, loadFontsForRenderer, resolveSubsetChain } from '../fonts'
 import { getExtractResourceUrls, getTakumi } from './instances'
 import { createTakumiNodes } from './nodes'
+import { createMp4Encoder, resolveVideoOptions } from './video'
 
 const RE_QUOTES = /['"]/g
 
@@ -235,7 +236,7 @@ function rewriteFontFamilies(node: Node, loadedFamilies: Set<string>, subsetChai
   }
 }
 
-async function createImage(event: OgImageRenderEventContext, format: 'png' | 'jpeg' | 'webp') {
+async function createImage(event: OgImageRenderEventContext, format: 'png' | 'jpeg' | 'webp' | 'mp4') {
   const { options, timings } = event
 
   const { fontFamilyOverride, defaultFont } = getDefaultFontFamily(options)
@@ -314,10 +315,12 @@ async function createImage(event: OgImageRenderEventContext, format: 'png' | 'jp
   const maxDpr = event.runtimeConfig.security?.maxDpr || 2
   const maxDim = event.runtimeConfig.security?.maxDimension || 2048
   const dpr = Math.min(Math.max(1, options.takumi?.devicePixelRatio ?? 1), maxDpr)
+  const video = format === 'mp4' ? resolveVideoOptions(options.video) : undefined
   const renderOptions: Record<string, any> = defu(takumiOptions, {
-    width: Math.min(Number(options.width) * dpr, maxDim),
-    height: Math.min(Number(options.height) * dpr, maxDim),
-    format,
+    // libx264 with yuv420p needs even dimensions
+    width: evenIf(Math.min(Number(options.width) * dpr, maxDim), !!video),
+    height: evenIf(Math.min(Number(options.height) * dpr, maxDim), !!video),
+    format: video ? 'raw' : format,
     images,
     devicePixelRatio: dpr,
   })
@@ -328,7 +331,7 @@ async function createImage(event: OgImageRenderEventContext, format: 'png' | 'jp
   // covers post-acquire work so the two are additive and attributable.
   const lockTimeout = event.runtimeConfig.security?.renderTimeout ?? 15_000
   const endLockWait = timings.start('lock-wait')
-  return await withTakumiLock(state, lockTimeout, () => {
+  const rendered = await withTakumiLock(state, lockTimeout, () => {
     endLockWait()
     return timings.measure('render-takumi', async () => {
       const loadedFamilies = new Set(fontEntries.map(entry => entry.family))
@@ -348,14 +351,33 @@ async function createImage(event: OgImageRenderEventContext, format: 'png' | 'jp
       nodes.style = rootStyle
       rewriteFontFamilies(nodes, loadedFamilies, subsetChains)
 
-      return await state.renderer.render(nodes, renderOptions)
+      if (!video)
+        return await state.renderer.render(nodes, renderOptions)
+      const encoder = await createMp4Encoder({ width: renderOptions.width, height: renderOptions.height, fps: video.fps })
+      try {
+        const frameCount = Math.max(1, Math.round(video.durationMs / 1000 * video.fps))
+        for (let i = 0; i < frameCount; i++)
+          await encoder.write(await state.renderer.render(nodes, { ...renderOptions, timeMs: i * 1000 / video.fps }))
+      }
+      catch (err) {
+        encoder.abort()
+        throw err
+      }
+      return encoder
     })
   }, endLockWait)
+  if (!video)
+    return rendered as Uint8Array
+  return timings.measure('encode-mp4', () => (rendered as Awaited<ReturnType<typeof createMp4Encoder>>).finish())
+}
+
+function evenIf(n: number, condition: boolean) {
+  return condition ? n - (n % 2) : n
 }
 
 const TakumiRenderer: Renderer = {
   name: 'takumi',
-  supportedFormats: ['png', 'jpeg', 'jpg', 'webp', 'json'],
+  supportedFormats: ['png', 'jpeg', 'jpg', 'webp', 'json', 'mp4'],
 
   async createImage(e) {
     switch (e.extension) {
@@ -366,6 +388,8 @@ const TakumiRenderer: Renderer = {
         return createImage(e, 'jpeg')
       case 'webp':
         return createImage(e, 'webp')
+      case 'mp4':
+        return createImage(e, 'mp4')
     }
   },
 
