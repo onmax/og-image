@@ -28,6 +28,7 @@ const RE_NAMED_CALL = /\b(defineOgImage(?:Component)?)\s*\(\s*(['"`])([\w.-]+)\2
 const RE_SCREENSHOT_CALL = /\bdefineOgImageScreenshot\s*\(/g
 const RE_ANY_CALL = /\bdefineOgImage(?:Component)?\s*\(/g
 const RE_VUE_OR_SCRIPT = /\.(?:vue|[cm]?[jt]sx?)$/
+const RE_DEFINE_OG_IMAGE = /defineOgImage/
 
 /**
  * Find OG image calls that build fine but can never render in production:
@@ -164,15 +165,21 @@ export const OgImageUsageCheckPlugin = createUnplugin((options: { getContext: ()
       references.hasDynamicName = false
       references.usesDefault = false
     },
-    transform(code, id) {
-      const [path] = id.split('?')
-      if (!path || !RE_VUE_OR_SCRIPT.test(path) || path.includes('/node_modules/') || options.ignoreDirs.some(dir => path.startsWith(dir)))
-        return
-      for (const error of findOgImageUsageErrors(code, options.getContext()))
-        errors.push(`${path}: ${error}`)
-      const found = collectOgImageReferences(code)
-      references.names.push(...found.names)
-      references.hasDynamicName ||= found.hasDynamicName
+    transform: {
+      // both checks below return early for code that never mentions `defineOgImage`
+      filter: {
+        code: RE_DEFINE_OG_IMAGE,
+      },
+      handler(code, id) {
+        const [path] = id.split('?')
+        if (!path || !RE_VUE_OR_SCRIPT.test(path) || path.includes('/node_modules/') || options.ignoreDirs.some(dir => path.startsWith(dir)))
+          return
+        for (const error of findOgImageUsageErrors(code, options.getContext()))
+          errors.push(`${path}: ${error}`)
+        const found = collectOgImageReferences(code)
+        references.names.push(...found.names)
+        references.hasDynamicName ||= found.hasDynamicName
+      },
     },
     buildEnd() {
       const ctx = options.getContext()
